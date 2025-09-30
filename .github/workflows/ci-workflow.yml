@@ -1,24 +1,22 @@
 name: Build XIVLauncher
 on: [push, pull_request]
-concurrency: build_xl
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-release:
-    name: Build Release on Windows
-    if: startsWith(github.ref, 'refs/tags/')
+  build:
+    name: Build Project
     runs-on: windows-2022
-    permissions:
-      id-token: write
-      contents: write # Must be 'write' to create a release
-      attestations: write
     steps:
-#      - uses: nadock/verified_commits_check@f9b330e987c2e7121dfc0230e65cb5751ee5fac9
       - uses: actions/checkout@v1
       - name: Initialize Submodules
         run: git submodule update --init --recursive
-      - name: Install VPK
-        run: |
-          dotnet tool install -g vpk
+      - name: Setup dotnet with cache
+        uses: actions/setup-dotnet@v4
+        with:
+          cache: true
+          cache-dependency-path: "src/**/packages.lock.json"
       - name: Publish XIVLauncher
         run: |
           cd src/XIVLauncher
@@ -32,6 +30,26 @@ jobs:
           $SourceFolder = "./src/XIVLauncher.PatchInstaller/publish"
           $DestinationFolder = "./src/XIVLauncher/publish"
           robocopy $SourceFolder $DestinationFolder /S /E /XO /IT
+          $lastExitCode = $LASTEXITCODE
+          if ($lastExitCode -eq 0) {
+            Write-Host "Robocopy completed successfully with no changes."
+          } elseif ($lastExitCode -eq 1) {
+            Write-Host "Robocopy completed successfully; All files were copied successfully."
+          } elseif ($lastExitCode -eq 2) {
+            Write-Host "Robocopy completed successfully; There are some additional files in the destination directory that aren't present in the source directory. No files were copied."
+          } elseif ($lastExitCode -eq 3) {
+            Write-Host "Robocopy completed successfully; Some files were copied. Additional files were present. No failure was met."
+          } elseif ($lastExitCode -eq 5) {
+            Write-Host "Robocopy completed successfully; Some files were copied. Some files were mismatched. No failure was met."
+          } elseif ($lastExitCode -eq 6) {
+            Write-Host "Robocopy completed successfully; Additional files and mismatched files exist. No files were copied and no failures were met. Which means that the files already exist in the destination directory."
+          } elseif ($lastExitCode -eq 7) {
+            Write-Host "Robocopy completed successfully; Files were copied, a file mismatch was present, and additional files were present."
+          } else {
+            Write-Error "Robocopy encountered errors. Exit code: $lastExitCode"
+            exit 1
+          }
+          exit 0
       - name: Generate Hashes File
         run: ./scripts/CreateHashList.ps1 ./src/XIVLauncher/publish
       - name: Attest Artifacts
@@ -43,27 +61,59 @@ jobs:
             src/XIVLauncher/publish/XIVLauncher.*.dll
             src/XIVLauncher/publish/XIVLauncher.*.exe
             src/XIVLauncher/publish/hashes.json
-      - name: Build Velopack Release
-        id: build-velopack
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xivlauncher-artifact
+          path: src/XIVLauncher/publish/
+  publish-release:
+    name: Build Release on Windows
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: build
+    runs-on: windows-2022
+    permissions:
+      id-token: write
+      contents: write # Must be 'write' to create a release
+      attestations: write
+    steps:
+#      - uses: nadock/verified_commits_check@f9b330e987c2e7121dfc0230e65cb5751ee5fac9
+      - uses: actions/checkout@v1
+      - uses: actions/download-artifact@v4
+        with:
+          name: xivlauncher-artifact
+          path: src/XIVLauncher/publish
+      - name: Install VPK
+        run: |
+          dotnet tool install -g vpk
+      - name: Get SemVer
+        id: semver
+        run: |
+          $refver = $env:GITHUB_REF -replace '.*/'
+          echo "version=$($refver)" >> $Env:GITHUB_OUTPUT
+      - name: Download prev release
+        id: prev-rel
         run: |
           cd src/XIVLauncher
           $releases = Invoke-WebRequest -Uri 'https://api.github.com/repos/goatcorp/FFXIVQuickLauncher/releases'
           $current = ConvertFrom-Json -InputObject $releases.Content | Select-Object -First 1
-          $refver = $env:GITHUB_REF -replace '.*/'
-          echo "::set-output name=version::$refver"
           mkdir Releases
+          $prev_release_files = $current.assets | Where-Object -Property name -Match "^(RELEASES|.*\.nupkg)$"
+          $prev_release_files | ForEach-Object {
+            Invoke-WebRequest -Uri $_.browser_download_url -OutFile ".\Releases\$($_.name)"
+          }
+          echo "oldfiles=$($prev_release_files | Where-Object -Property name -Match "^.*\.nupkg$" | Select-Object name | ConvertTo-Json -Compress)" >> $Env:GITHUB_OUTPUT
+      - name: Build Velopack Release
+        id: build-velopack
+        env:
+          version: ${{ steps.semver.outputs.version }}
+          oldfiles: ${{ steps.prev-rel.outputs.oldfiles }}
+        run: |
+          cd src/XIVLauncher
           cp .\Resources\CHANGELOG.txt .\Releases\
-          $release_file = $current.assets | Where-Object -Property name -Value RELEASES -EQ
-          Invoke-WebRequest -Uri $release_file.browser_download_url -OutFile .\Releases\RELEASES
-          $delta_file = $current.assets | Where-Object -Property name -Value "*delta.nupkg" -Like
-          Invoke-WebRequest -Uri $delta_file.browser_download_url -OutFile ".\Releases\$($delta_file.name)"
-          $full_file = $current.assets | Where-Object -Property name -Value "*full.nupkg" -Like
-          Invoke-WebRequest -Uri $full_file.browser_download_url -OutFile ".\Releases\$($full_file.name)"
-          vpk pack -u XIVLauncher -v $refver -p .\publish\ -e XIVLauncher.exe -i .\Resources\dalamud_icon.ico
-          Start-Sleep -s 60
-          rm ".\Releases\$($delta_file.name)"
-          rm ".\Releases\$($full_file.name)"
-          rm ".\Releases\XIVLauncher-win-Portable.zip"
+          vpk pack -u XIVLauncher -v $version -p .\publish\ -e XIVLauncher.exe -i .\Resources\dalamud_icon.ico --noPortable
+          ConvertFrom-Json $oldfiles | ForEach-Object {
+            rm ".\Releases\$($_.name)"
+          }
       - name: Attest Setup
         if: ${{ github.repository_owner == 'goatcorp' && github.event_name == 'push' }}
         uses: actions/attest-build-provenance@v1
@@ -80,7 +130,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: ./src/XIVLauncher/Releases/**
-          name: Release ${{ steps.build-velopack.outputs.version }}
+          name: Release ${{ steps.semver.outputs.version }}
           body_path:  RELEASE.md
           prerelease: true
 
@@ -90,36 +140,3 @@ jobs:
       #  with:
       #    vt_api_key: ${{ secrets.VT_API_KEY }}
       #    files: ./src/XIVLauncher/Releases/*.exe
-
-  build:
-    name: Build on Windows
-    runs-on: windows-2022
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    permissions:
-      id-token: write
-      contents: read
-      attestations: write
-    steps:
-      - uses: actions/checkout@v1
-      - name: Initialize Submodules
-        run: git submodule update --init --recursive
-      - name: Publish XIVLauncher
-        run: |
-          cd src/XIVLauncher
-          dotnet publish --self-contained -r win-x64 -o publish
-      - name: Generate Hashes File
-        run: ./scripts/CreateHashList.ps1 ./src/XIVLauncher/publish/
-      - name: Attest Artifacts
-        if: ${{ github.repository_owner == 'goatcorp' && github.event_name == 'push' }}
-        uses: actions/attest-build-provenance@v1
-        with:
-          subject-path: |
-            src/XIVLauncher/publish/XIVLauncher.exe
-            src/XIVLauncher/publish/XIVLauncher.*.dll
-            src/XIVLauncher/publish/XIVLauncher.*.exe
-            src/XIVLauncher/publish/hashes.json
-      - name: Upload artifact
-        uses: actions/upload-artifact@master
-        with:
-          name: xivlauncher-artifact
-          path: src/XIVLauncher/publish/
