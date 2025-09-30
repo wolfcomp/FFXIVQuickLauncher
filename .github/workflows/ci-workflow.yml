@@ -91,7 +91,6 @@ jobs:
           $refver = $env:GITHUB_REF -replace '.*/'
           echo "version=$($refver)" >> $Env:GITHUB_OUTPUT
       - name: Download prev release
-        id: prev-rel
         run: |
           cd src/XIVLauncher
           $releases = Invoke-WebRequest -Uri 'https://api.github.com/repos/goatcorp/FFXIVQuickLauncher/releases'
@@ -101,17 +100,14 @@ jobs:
           $prev_release_files | ForEach-Object {
             Invoke-WebRequest -Uri $_.browser_download_url -OutFile ".\Releases\$($_.name)"
           }
-          echo "oldfiles='$($prev_release_files | Where-Object -Property name -Match "^.*\.nupkg$" | Select-Object name | ConvertTo-Json -Compress)'" >> $Env:GITHUB_OUTPUT
       - name: Build Velopack Release
-        id: build-velopack
         env:
           version: ${{ steps.semver.outputs.version }}
-          oldfiles: ${{ steps.prev-rel.outputs.oldfiles }}
         run: |
           cd src/XIVLauncher
           cp .\Resources\CHANGELOG.txt .\Releases\
           vpk pack -u XIVLauncher -v $Env:version -p .\publish\ -e XIVLauncher.exe -i .\Resources\dalamud_icon.ico --noPortable
-          ConvertFrom-Json $Env:oldfiles | ForEach-Object {
+          Get-ChildItem .\Releases\ | Where-Object -Property name -Match "^XIVLauncher-(?!$($Env:version)).*\.nupkg$" | ForEach-Object {
             rm ".\Releases\$($_.name)"
           }
       - name: Attest Setup
