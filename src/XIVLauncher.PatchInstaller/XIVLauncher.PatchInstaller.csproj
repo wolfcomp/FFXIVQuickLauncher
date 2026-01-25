@@ -8,6 +8,7 @@
     </Description>
     <VersionPrefix>1.4.0</VersionPrefix>
     <Nullable>enable</Nullable>
+    <Platforms>Win-x64</Platforms>
   </PropertyGroup>
 
   <PropertyGroup>
